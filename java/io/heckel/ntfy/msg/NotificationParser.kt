@@ -1,0 +1,108 @@
+package io.heckel.ntfy.msg
+
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import io.heckel.ntfy.db.Action
+import io.heckel.ntfy.db.Attachment
+import io.heckel.ntfy.db.Icon
+import io.heckel.ntfy.db.Notification
+import io.heckel.ntfy.util.deriveNotificationId
+import io.heckel.ntfy.util.joinTags
+import io.heckel.ntfy.util.toPriority
+import java.lang.reflect.Type
+
+class NotificationParser {
+    private val gson = Gson()
+
+    fun parse(s: String, subscriptionId: Long = 0, baseUrl: String = ""): Notification? {
+        val notificationWithTopic = parseWithTopic(s, subscriptionId = subscriptionId, baseUrl = baseUrl)
+        return notificationWithTopic?.notification
+    }
+
+    fun parseWithTopic(s: String, subscriptionId: Long = 0, baseUrl: String = ""): NotificationWithTopic? {
+        val message = gson.fromJson(s, Message::class.java)
+        val validEvent = message.event == ApiService.EVENT_MESSAGE ||
+                message.event == ApiService.EVENT_MESSAGE_DELETE ||
+                message.event == ApiService.EVENT_MESSAGE_CLEAR
+        if (!validEvent) {
+            return null
+        }
+        val attachment = if (message.attachment?.url != null) {
+            Attachment(
+                name = message.attachment.name,
+                type = message.attachment.type,
+                size = message.attachment.size,
+                expires = message.attachment.expires,
+                url = message.attachment.url,
+            )
+        } else null
+        val actions = message.actions?.map { a ->
+            Action(
+                id = a.id,
+                action = a.action,
+                label = a.label,
+                clear = a.clear,
+                url = a.url,
+                method = a.method,
+                headers = a.headers,
+                body = a.body,
+                intent = a.intent,
+                extras = a.extras,
+                value = a.value,
+                progress = null,
+                error = null
+            )
+        }
+        val icon: Icon? = if (message.icon != null && message.icon != "") Icon(url = message.icon) else null
+        val sequenceId = message.sequenceId ?: message.id // Default to id if sequenceId not provided
+        val topic = message.topic
+        val notification = Notification(
+            id = message.id,
+            subscriptionId = subscriptionId,
+            timestamp = message.time,
+            sequenceId = sequenceId,
+            title = message.title ?: "",
+            message = message.message ?: "",
+            contentType = message.contentType ?: "",
+            encoding = message.encoding ?: "",
+            priority = toPriority(message.priority),
+            tags = joinTags(message.tags),
+            click = message.click ?: "",
+            icon = icon,
+            actions = actions,
+            attachment = attachment,
+            notificationId = deriveNotificationId(baseUrl, topic, sequenceId),
+            deleted = false,
+            event = message.event
+        )
+        return NotificationWithTopic(topic, notification)
+    }
+
+    /**
+     * Parse JSON array to Action list. The indirection via MessageAction is probably
+     * not necessary, but for "good form".
+     */
+    fun parseActions(s: String?): List<Action>? {
+        val listType: Type = object : TypeToken<List<MessageAction>?>() {}.type
+        val messageActions: List<MessageAction>? = gson.fromJson(s, listType)
+        return messageActions?.map { a ->
+            Action(
+                id = a.id,
+                action = a.action,
+                label = a.label,
+                clear = a.clear,
+                url = a.url,
+                method = a.method,
+                headers = a.headers,
+                body = a.body,
+                intent = a.intent,
+                extras = a.extras,
+                value = a.value,
+                progress = null,
+                error = null
+            )
+        }
+    }
+
+    data class NotificationWithTopic(val topic: String, val notification: Notification)
+}

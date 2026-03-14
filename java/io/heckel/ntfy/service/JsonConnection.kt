@@ -1,0 +1,99 @@
+package io.heckel.ntfy.service
+
+import io.heckel.ntfy.db.ConnectionState
+import io.heckel.ntfy.db.Notification
+import io.heckel.ntfy.db.Repository
+import io.heckel.ntfy.db.Subscription
+import io.heckel.ntfy.db.User
+import io.heckel.ntfy.msg.ApiService
+import io.heckel.ntfy.msg.NotificationParser
+import io.heckel.ntfy.util.Log
+import io.heckel.ntfy.util.topicUrl
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import okhttp3.Call
+
+class JsonConnection(
+    private val connectionId: ConnectionId,
+    private val repository: Repository,
+    private val api: ApiService,
+    private val user: User?,
+    private val connectionDetailsListener: (String, ConnectionState, Throwable?, Long) -> Unit,
+    private val notificationListener: (Subscription, Notification) -> Unit,
+    private val serviceActive: () -> Boolean
+) : Connection {
+    private val baseUrl = connectionId.baseUrl
+    private val topicsToSubscriptionIds = connectionId.topicsToSubscriptionIds
+    private val topicsStr = topicsToSubscriptionIds.keys.joinToString(separator = ",")
+    private val url = topicUrl(baseUrl, topicsStr)
+    private val parser = NotificationParser()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private var errorCount = 0
+    private lateinit var call: Call
+
+    override fun start() {
+        scope.launch {
+            Log.d(TAG, "[$url] Starting connection for subscriptions: $topicsToSubscriptionIds")
+
+            while (isActive && serviceActive()) {
+                Log.d(TAG, "[$url] (Re-)starting connection for subscriptions: $topicsToSubscriptionIds")
+                val since = repository.getLastNotificationId(topicsToSubscriptionIds.values) ?: ApiService.SINCE_NONE
+
+                try {
+                    val (newCall, source) = api.subscribe(baseUrl, topicsStr, since, user)
+                    call = newCall
+                    if (errorCount > 0) {
+                        errorCount = 0
+                    }
+                    connectionDetailsListener(baseUrl, ConnectionState.CONNECTED, null, 0L)
+                    
+                    // Blocking read loop: reads JSON lines until connection closes or is cancelled
+                    while (isActive && serviceActive() && !source.exhausted()) {
+                        val line = source.readUtf8Line() ?: break
+                        val notificationWithTopic = parser.parseWithTopic(line, subscriptionId = 0, baseUrl = baseUrl)
+                        if (notificationWithTopic != null) {
+                            val topic = notificationWithTopic.topic
+                            val subscriptionId = topicsToSubscriptionIds[topic] ?: continue
+                            val subscription = repository.getSubscription(subscriptionId) ?: continue
+                            val notification = notificationWithTopic.notification.copy(subscriptionId = subscription.id)
+                            notificationListener(subscription, notification)
+                        }
+                    }
+                    
+                    Log.d(TAG, "[$url] Connection closed cleanly")
+                } catch (e: Exception) {
+                    if (!isActive) {
+                        Log.d(TAG, "[$url] Connection cancelled")
+                        break
+                    }
+                    Log.d(TAG, "[$url] Connection broken, reconnecting ...")
+                    errorCount++
+                    val retrySeconds = RETRY_SECONDS.getOrNull(errorCount-1) ?: RETRY_SECONDS.last()
+                    val nextRetryTime = System.currentTimeMillis() + (retrySeconds * 1000L)
+                    val error = if (isConnectionBrokenException(e)) null else e
+                    connectionDetailsListener(baseUrl, ConnectionState.CONNECTING, error, nextRetryTime)
+                    Log.w(TAG, "[$url] Retrying connection in ${retrySeconds}s ...")
+                    delay(retrySeconds * 1000L)
+                }
+            }
+            Log.d(TAG, "[$url] Connection fully SHUT DOWN")
+        }
+    }
+
+    override fun close() {
+        Log.d(TAG, "[$url] Cancelling connection")
+        scope.cancel()
+        if (this::call.isInitialized) call.cancel()
+    }
+
+    companion object {
+        private const val TAG = "NtfyJsonConnection"
+        private val RETRY_SECONDS = listOf(5, 10, 15, 20, 30, 45, 60, 120)
+    }
+}

@@ -1,0 +1,127 @@
+package io.heckel.ntfy.msg
+
+import android.content.Context
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import io.heckel.ntfy.R
+import io.heckel.ntfy.app.Application
+import io.heckel.ntfy.db.ACTION_PROGRESS_FAILED
+import io.heckel.ntfy.db.ACTION_PROGRESS_ONGOING
+import io.heckel.ntfy.db.ACTION_PROGRESS_SUCCESS
+import io.heckel.ntfy.db.Action
+import io.heckel.ntfy.db.Notification
+import io.heckel.ntfy.db.Repository
+import io.heckel.ntfy.db.Subscription
+import io.heckel.ntfy.msg.NotificationService.Companion.ACTION_BROADCAST
+import io.heckel.ntfy.msg.NotificationService.Companion.ACTION_COPY
+import io.heckel.ntfy.msg.NotificationService.Companion.ACTION_HTTP
+import io.heckel.ntfy.util.HttpUtil
+import io.heckel.ntfy.util.Log
+import io.heckel.ntfy.util.copyToClipboard
+import io.heckel.ntfy.util.extractBaseUrl
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.Locale
+
+class UserActionWorker(private val context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    private val notifier = NotificationService(context)
+    private val broadcaster = BroadcastService(context)
+    private lateinit var repository: Repository
+    private lateinit var subscription: Subscription
+    private lateinit var notification: Notification
+    private lateinit var action: Action
+
+    override suspend fun doWork(): Result {
+        if (context.applicationContext !is Application) return Result.failure()
+        val notificationId = inputData.getString(INPUT_DATA_NOTIFICATION_ID) ?: return Result.failure()
+        val actionId = inputData.getString(INPUT_DATA_ACTION_ID) ?: return Result.failure()
+        val app = context.applicationContext as Application
+
+        repository = app.repository
+        notification = repository.getNotification(notificationId) ?: return Result.failure()
+        subscription = repository.getSubscription(notification.subscriptionId) ?: return Result.failure()
+        action = notification.actions?.first { it.id == actionId } ?: return Result.failure()
+
+        Log.d(TAG, "Executing action $action for notification $notification")
+        try {
+            when (action.action) {
+                // ACTION_VIEW is not handled here. It's handled in the NotificationService and DetailAdapter.
+                ACTION_BROADCAST -> performBroadcastAction(action)
+                ACTION_HTTP -> performHttpAction(action)
+                ACTION_COPY -> performCopyAction(action)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error executing action: ${e.message}", e)
+            save(action.copy(
+                progress = ACTION_PROGRESS_FAILED,
+                error = context.getString(R.string.notification_popup_user_action_failed, action.label, e.message)
+            ))
+        }
+        return Result.success()
+    }
+
+    private fun performCopyAction(action: Action) {
+        val value = action.value ?: return
+        copyToClipboard(context, action.label, value)
+        if (action.clear == true) {
+            notifier.cancel(notification)
+            repository.markAsReadBySequenceId(subscription.id, notification.sequenceId)
+        }
+    }
+
+    private fun performBroadcastAction(action: Action) {
+        broadcaster.sendUserAction(action)
+        if (action.clear == true) {
+            notifier.cancel(notification)
+            repository.markAsReadBySequenceId(subscription.id, notification.sequenceId)
+        }
+    }
+
+    private suspend fun performHttpAction(action: Action) {
+        save(action.copy(progress = ACTION_PROGRESS_ONGOING, error = null))
+
+        val url = action.url ?: return
+        val method = action.method ?: DEFAULT_HTTP_ACTION_METHOD
+        val defaultBody = if (listOf("GET", "HEAD").contains(method)) null else ""
+        val body = action.body ?: defaultBody
+        val builder = HttpUtil.requestBuilder(url)
+            .method(method, body?.toRequestBody())
+        action.headers?.forEach { (key, value) ->
+            builder.addHeader(key, value)
+        }
+        val request = builder.build()
+        val client = HttpUtil.defaultClient(context, extractBaseUrl(url))
+
+        Log.d(TAG, "Executing HTTP request: ${method.uppercase(Locale.getDefault())} ${action.url}")
+        client.newCall(request).execute().use { response ->
+            if (response.isSuccessful) {
+                save(action.copy(progress = ACTION_PROGRESS_SUCCESS, error = null))
+                return
+            }
+            throw Exception("HTTP ${response.code}")
+        }
+    }
+
+    private fun save(newAction: Action) {
+        Log.d(TAG, "Updating action: $newAction")
+        val clear = newAction.progress == ACTION_PROGRESS_SUCCESS && action.clear == true
+        val newActions = notification.actions?.map { a -> if (a.id == newAction.id) newAction else a }
+        val newNotification = notification.copy(actions = newActions)
+        action = newAction
+        notification = newNotification
+        repository.updateNotification(notification)
+        if (clear) {
+            notifier.cancel(notification)
+            repository.markAsReadBySequenceId(subscription.id, notification.sequenceId)
+        } else {
+            notifier.update(subscription, notification)
+        }
+    }
+
+    companion object {
+        const val INPUT_DATA_NOTIFICATION_ID = "notificationId"
+        const val INPUT_DATA_ACTION_ID = "actionId"
+
+        private const val DEFAULT_HTTP_ACTION_METHOD = "POST" // Cannot be changed without changing the contract
+        private const val TAG = "NtfyUserActWrk"
+    }
+}
